@@ -1,0 +1,81 @@
+ @InvocableMethod(
+        label='Process Account Records'
+        description='Processes a list of Account Ids — validates, enriches, and updates records safely'
+        category='Account Management'
+    )
+    public static List<ActionResult> processAccounts(List<ActionRequest> requests) {
+ 
+        List<ActionResult> results = new List<ActionResult>();
+ 
+        // Agentforce can batch multiple requests in one call
+        //  Process all at once (bulkified) — never loop and call service per request
+        if (requests == null || requests.isEmpty()) {
+            results.add(buildError('No input received from Agent'));
+            return results;
+        }
+ 
+        //Collect all IDs into one set for a single pass, no per-request processing
+        Set<Id> accountIds = new Set<Id>();
+        for (ActionRequest req : requests) {
+            if (String.isNotBlank(req.accountId)) {
+                accountIds.add(req.accountId);
+            }
+        }
+ 
+        // Validation before hitting service layer
+        if (accountIds.isEmpty()) {
+            results.add(buildError('No valid Account IDs provided'));
+            return results;
+        }
+ 
+        // Check if dataset is large enough to warrant async processing
+        //Threshold: >200 records → offload to Queueable to avoid CPU limits
+        try {
+            if (accountIds.size() > 200) {
+          // Enqueue async job returns immediately to Agent with job confirmation
+                Id jobId = System.enqueueJob(
+                    new AccountProcessingQueueable(accountIds)
+                );
+                results.add(buildAsyncSuccess(jobId, accountIds.size()));
+            } else {
+         // Small batch → process synchronously via Service Layer
+                AgentforceAccountService.ProcessResult serviceResult =
+                    AgentforceAccountService.processAccountBatch(accountIds);
+                results.add(buildSyncSuccess(serviceResult));
+            }
+        } catch (AgentforceAccountService.ServiceException e) {
+            results.add(buildError('Service error: ' + e.getMessage()));
+        } catch (Exception e) {
+            results.add(buildError('Unexpected error: ' + e.getMessage()));
+        }
+ 
+        return results;
+    }
+ 
+    //Private helpers to build strongly-typed response objects
+    private static ActionResult buildError(String message) {
+        ActionResult r = new ActionResult();
+        r.isSuccess    = false;
+        r.errorMessage = message;
+        r.recordsProcessed = 0;
+        return r;
+    }
+ 
+    private static ActionResult buildAsyncSuccess(Id jobId, Integer count) {
+        ActionResult r = new ActionResult();
+        r.isSuccess    = true;
+        r.jobId        = String.valueOf(jobId);
+        r.recordsProcessed = count;
+        r.statusMessage = count + ' accounts queued for async processing. Job ID: ' + jobId;
+        return r;
+    }
+ 
+    private static ActionResult buildSyncSuccess(AgentforceAccountService.ProcessResult res) {
+        ActionResult r = new ActionResult();
+        r.isSuccess        = true;
+        r.recordsProcessed = res.successCount;
+        r.statusMessage    = 'Processed ' + res.successCount + ' accounts.'
+                           + res.failCount + ' failed.';
+        r.errorMessage     = res.errors.isEmpty() ? null : String.join(res.errors, '; ');
+        return r;
+    }
